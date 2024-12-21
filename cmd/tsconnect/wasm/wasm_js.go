@@ -20,7 +20,9 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall/js"
 	"time"
 
@@ -29,6 +31,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnserver"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail"
@@ -203,6 +206,13 @@ func newIPN(jsConfig js.Value) map[string]any {
 
 			url := args[0].String()
 			return jsIPN.fetch(url)
+		}),
+		"tcp": js.FuncOf(func(this js.Value, args []js.Value) any {
+			if len(args) != 2 {
+				log.Printf("Usage: tcp(host, port)")
+				return nil
+			}
+			return jsIPN.tcp(args[0].String(), args[1].Int())
 		}),
 	}
 }
@@ -679,4 +689,133 @@ func (t *noCORSTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		resp.Status = http.StatusText(http.StatusOK)
 	}
 	return resp, err
+}
+
+func (i *jsIPN) tcp(host string, port int) map[string]any {
+	// Find an available exit node
+	var exitNode *ipnstate.PeerStatus
+	for _, peerKey := range i.lb.Status().Peers() {
+		peer := i.lb.Status().Peer[peerKey]
+		if peer.ExitNodeOption && peer.Online {
+			exitNode = peer
+			break
+		}
+	}
+
+	if exitNode == nil {
+		return map[string]any{
+			"error": "No available exit node found",
+		}
+	}
+
+	// Set this peer as our exit node
+	// i.lb.Prefs().AsStruct().SetExitNodeIP(exitNode.)
+
+	jsTCPConn := &jsTCPConn{
+		jsIPN: i,
+		host:  host,
+		port:  port,
+	}
+
+	// Return JavaScript object with methods to interact with the connection
+	return map[string]any{
+		"write": js.FuncOf(func(this js.Value, args []js.Value) any {
+			if len(args) != 1 {
+				return makePromise(func() (any, error) {
+					return nil, fmt.Errorf("Usage: write(data)")
+				})
+			}
+			data := []byte(args[0].String())
+			return makePromise(func() (any, error) {
+				fmt.Println("brrrr start write")
+				n, err := jsTCPConn.Write(data)
+				if err != nil {
+					return nil, err
+				}
+				return n, nil
+			})
+		}),
+		"read": js.FuncOf(func(this js.Value, args []js.Value) any {
+			return makePromise(func() (any, error) {
+				fmt.Println("brrrr start read")
+				buf := make([]byte, 4096)
+				n, err := jsTCPConn.Read(buf)
+				if err != nil {
+					return nil, err
+				}
+				return string(buf[:n]), nil
+			})
+		}),
+		"close": js.FuncOf(func(this js.Value, args []js.Value) any {
+			return makePromise(func() (any, error) {
+				return nil, jsTCPConn.Close()
+			})
+		}),
+	}
+}
+
+// jsTCPConn handles a TCP connection
+type jsTCPConn struct {
+	jsIPN *jsIPN
+	host  string
+	port  int
+
+	conn     net.Conn
+	connLock sync.Mutex
+}
+
+func (c *jsTCPConn) connect() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Use the dialer that's configured to use the exit node
+	targetAddr := net.JoinHostPort(c.host, strconv.Itoa(c.port))
+	fmt.Println("brrrr targetAddr", targetAddr)
+	conn, err := c.jsIPN.dialer.UserDial(ctx, "tcp", targetAddr)
+	fmt.Println("brrrr connect conn", conn)
+	if err != nil {
+		return fmt.Errorf("connection failed: %v", err)
+	}
+
+	c.conn = conn
+	return nil
+}
+
+func (c *jsTCPConn) Write(data []byte) (int, error) {
+	c.connLock.Lock()
+	defer c.connLock.Unlock()
+
+	fmt.Println("brrrr write", c.conn)
+	if c.conn == nil {
+		if err := c.connect(); err != nil {
+			fmt.Println("brrrr connect error", err)
+			return 0, err
+		}
+	}
+	return c.conn.Write(data)
+}
+
+func (c *jsTCPConn) Read(buf []byte) (int, error) {
+	c.connLock.Lock()
+	defer c.connLock.Unlock()
+
+	fmt.Println("brrrr read", c.conn)
+	if c.conn == nil {
+		if err := c.connect(); err != nil {
+			return 0, err
+		}
+	}
+	return c.conn.Read(buf)
+}
+
+func (c *jsTCPConn) Close() error {
+	c.connLock.Lock()
+	defer c.connLock.Unlock()
+
+	if c.conn == nil {
+		return nil
+	}
+	err := c.conn.Close()
+	c.conn = nil
+	return err
 }

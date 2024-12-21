@@ -41,7 +41,13 @@ func main() {
 	case "dev-pkg":
 		runDevPkg()
 	case "build":
-		runBuild()
+		os.Chdir("./cmd/tsconnect")
+		content, err := buildWasm(true)
+		if err != nil {
+			log.Fatalf("Cannot build WASM: %v", err)
+		}
+		os.WriteFile("./pkg/main.wasm", content, 0644)
+		// runBuild()
 	case "build-pkg":
 		runBuildPkg()
 	case "serve":
